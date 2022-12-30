@@ -1,0 +1,495 @@
+---
+title: "Final Assignment"
+author: "Alex Carriero"
+date: "19/05/2022"
+output: html_document
+---
+```{r, warning=F, message=F}
+# Libraries
+library(tidyverse)
+library(cowplot)
+library(bain)
+```
+
+```{r}
+# Import Data 
+insurance <- read.csv("insurance.csv")
+d <- insurance %>% 
+    mutate(charges = log(charges))%>%                   # log transform y 
+    mutate_at(c("age","bmi","charges"), scale)%>%       # standardize continuous variables
+    mutate(smoker = ifelse(smoker =="no", -1, 1),       # center binary variables around zero
+           interaction = bmi*smoker)%>%
+    select(-children, -region)
+
+y  <- d$charges
+x1 <- d$age 
+x2 <- d$bmi
+x3 <- d$smoker
+x4 <- d$interaction
+```
+
+```{r}
+hist(y) # check that transformed y is now normally distributed 
+```
+
+```{r}
+# Sampler Set Up
+n  <- nrow(d)       # number of observations
+q  <- 6             # number of parameters
+ch <- 2             # number of chains
+# storage 
+b0s  <- c()
+b1s  <- c()
+b2s  <- c()
+b3s  <- c()
+b4s  <- c()
+s2s  <- c()
+ks   <- c()
+```
+
+```{r}
+# sampler functions for Gibbs sampling 
+gibbs_b0 <- function(b1,b2,b3,b4,s2,mu_00,s2_00){ # normal likelihood, normal prior 
+   mu_01  <-  ((sum(y - b1*x1 -b2*x2 - b3*x3 -b4*x4)/s2) + mu_00/s2_00) / (n/s2 + 1/s2_00)
+   s_01   <-  sqrt(1/(n/s2 + 1/s2_00))
+   b0     <-  rnorm(1, mu_01, s_01)
+   return(b0)}
+gibbs_b1 <- function(b0,b2,b3,b4,s2,mu_10,s2_10){ # normal likelihood, normal prior
+   mu_11  <-  ((sum(x1*(y - b0 - b2*x2 - b3*x3 -b4*x4))/s2) + mu_10/s2_10) / (sum(x1^2)/s2 + 1/s2_10)
+   s_11   <-  1/ (sum(x1^2)/s2 + 1/s2_10)
+   b1     <-  rnorm(1, mu_11, s_11)
+   return(b1)}
+gibbs_b3 <- function(b0,b1,b2,b4,s2,mu_30,s2_30){ # normal likelihood, normal prior
+   mu_31  <-  ((sum(x3*(y - b0 - b2*x2 - b1*x1 - b4*x4))/s2) + mu_30/s2_30) / (sum(x3^2)/s2 + 1/s2_30)
+   s_31   <-  1/ (sum(x3^2)/s2 + 1/s2_30)
+   b3     <-  rnorm(1, mu_31, s_31)
+   return(b3)}
+gibbs_b4 <- function(b0,b1,b2,b3,s2,mu_40,s2_40){ # normal likelihood, normal prior
+   mu_41  <-  ((sum(x4*(y - b0 - b2*x2 - b1*x1 - b3*x3))/s2) + mu_40/s2_40) / (sum(x4^2)/s2 + 1/s2_40)
+   s_41   <-  1/ (sum(x4^2)/s2 + 1/s2_40)
+   b4     <-  rnorm(1, mu_41, s_41)
+   return(b4)}
+gibbs_s2 <- function(b0,b1,b2,b3,b4,A0,B0){ # normal likelihood, inverse gamma prior
+   yhat   <-  b0 + b1*x1 + b2*x2 + b3*x3 + b4*x4
+   S      <-  sum((y-yhat)^2)
+   s2     <-  1 /rgamma(1, n*0.5 + A0, S*0.5 + B0)
+   return(s2)}
+```
+
+```{r}
+# sampler functions for mh step 
+loglikelihood <- function(b0,b1,b2,b3,b4,s2){ # normal likelihood
+  l_i  <- dnorm(y, mean = b0 + b1*x1 + b2*x2+ b3*x3 + b4*x4, sd = sqrt(s2))
+  ll_i <- log(l_i)
+  ll   <- sum(ll_i)
+  return(ll)}
+
+prior <- function(beta, mu_20, s2_20, nu){ # non-standardized t-distribution
+  exponent <-   - (nu +1)*0.5
+  base     <-   1 + 1/nu * (beta - mu_20)^2/s2_20
+  ns_t     <-   base^exponent
+  return(ns_t)}
+
+log_cpost<- function(b0,b1,b2,b3,b4,s2){ # log conditional posterior
+    o <- loglikelihood(b0,b1,b2,b3,b4,s2) + log(prior(b2, mu_20 = 0.01, s2_20 = 0.1, nu = n-q+1))
+    return(o)}
+
+mh_b2 <- function(b0,b1,b2,b3,b4,s2){
+   c  <- rnorm(1, mean = b2, sd = 0.1)                                  # sample proposal 
+   u  <- runif(1)                                                       # sample uniform 
+   pr <- exp(log_cpost(b0,b1,c,b3,b4,s2) - log_cpost(b0,b1,b2,b3,b4,s2))# conditional posterior ratio
+   qr <- 1                                                              # proposal ratio (symmetric)
+   r  <- pr*qr                                                          # acceptance ratio 
+   a  <- ifelse(r >= u, 1, 0)                                       
+   if (a == 1){
+     b2 <- c}
+   return(b2)}
+```
+
+```{r} 
+# mcmc sampler function
+mcmc_sampler<- function(b0,b1,b2,b3,b4,s2, interact=TRUE){
+burn_in = 10000
+sample  = 10000 
+nITER   = burn_in + sample
+
+for (l in 1:ch){
+   k = 0 
+   for(i in 1:nITER){
+   k = k+1 
+    if (interact == TRUE){
+    b0     <-  gibbs_b0(b1,b2,b3,b4,s2,-0.31, 0.1)   # sample b0 
+    b1     <-  gibbs_b1(b0,b2,b3,b4,s2, 0.32, 0.1)   # sample b1
+    b2     <-  mh_b2(b0,b1,b2,b3,b4,s2)              # sample b2
+    b3     <-  gibbs_b3(b0,b1,b2,b4,s2, 0.08, 0.1)   # sample b3 
+    b4     <-  gibbs_b4(b0,b1,b2,b3,s2, 0, 1)        # sample b4
+    s2     <-  gibbs_s2(b0,b1,b2,b3,b4,0.001,0.001)  # sample s2
+    }
+   else{
+    b0     <-  gibbs_b0(b1,b2,b3,b4,s2,-0.31, 0.1)   # sample b0 
+    b1     <-  gibbs_b1(b0,b2,b3,b4,s2, 0.32, 0.1)   # sample b1
+    b2     <-  mh_b2(b0,b1,b2,b3,b4,s2)              # sample b2
+    b3     <-  gibbs_b3(b0,b1,b2,b4,s2, 0.08, 0.1)   # sample b3 
+    b4     <-  0
+    s2     <-  gibbs_s2(b0,b1,b2,b3,b4,0.001,0.001)  # sample s2  
+   }
+   # storage 
+   b0s[i]  <- b0 
+   b1s[i]  <- b1
+   b2s[i]  <- b2
+   b3s[i]  <- b3
+   b4s[i]  <- b4
+   s2s[i]  <- s2
+   ks[i]   <- k
+   }
+ if (l == 1){
+  data = cbind(ks, b0s, b1s, b2s, b3s, b4s, s2s, l)
+  samples = as.data.frame(data[(burn_in+1):nITER,])
+ }
+ else{
+  data = cbind(ks, b0s, b1s, b2s, b3s, b4s, s2s, l)
+  s = as.data.frame(data[(burn_in+1):nITER,])
+  samples = rbind(samples, s)
+ }
+}
+samples$l <-as.factor(samples$l)
+samples
+}
+```
+
+```{r} 
+# Generate Samples for Interaction Model and Simple Model
+set.seed(711)
+samples <- mcmc_sampler(b0=0.5, b1=0.5, b2=0.15, b3=0.5, b4=0.5, s2=0.5, interact=T)  # interaction model
+write.csv(samples, "samples1.csv")
+samples2<- mcmc_sampler(b0=0.5, b1=0.5, b2=0.15, b3=0.5, b4=0,   s2=0.5, interact=F)  # no interaction
+write.csv(samples2,"samples2.csv")
+```
+
+```{r, fig.height=3, fig.width=11}
+# Trace All Together
+long_samples <- gather(samples, key="measure", value="value", c("b0s", "b1s", "b2s", "b3s", "b4s", "s2s"))
+
+ggplot(long_samples, aes(x = ks, y =value)) + 
+  geom_line(aes(color = as.factor(l)), alpha = 0.7) + 
+  scale_color_manual(values = c("#FFDB6D", "skyblue"),
+                     name="Chain")+
+  facet_wrap(~measure, scales ="free_y")+
+  ggtitle("Figure 1. Trace Plots for the Regression Parameters of the Interaction Model")+
+  theme(plot.title = element_text(face = "bold", size = 22))
+ggsave("traceplots.pdf") # save plot for report 
+```
+```{r, fig.height =3.2, fig.width =11}
+# Density Plots 
+ggplot(long_samples) + 
+  geom_density(aes(x = value, fill=l), alpha = 0.5, color = "white") + 
+  scale_fill_manual(values = c("#FFDB6D", "skyblue"), name="Chain")+
+  facet_wrap(~measure, scale="free")+
+  ggtitle("Figure 4. Density Plots of the Regression Parameters of the Interaction Model by Chain")+
+  theme(plot.title = element_text(face = "bold", size = 22))
+ggsave("hists.pdf") # save plot for report 
+```
+```{r, fig.height = 3.2, fig.width = 11} 
+# Chain 1 
+c1 <- samples %>% 
+      filter( l == 1 )%>%
+      select(-ks,-l)
+# Chain 2 
+c2 <- samples %>% 
+      filter( l == 2 )%>%
+      select(-ks,-l)
+
+# Autocorrelation Plots
+autocorrelation <- function(input, lags){
+  rho = c() 
+  lag = c()
+  for (i in 0:(lags-1)){
+    x = c(input[1:(500-i)])
+    y = c(input[(i+1):500])
+    rho[i+1] <- cor(x, y)
+    lag[i+1] <- i+1
+   }
+   return(autocorr<- as.data.frame(cbind(rho, lag)))
+}
+# b0 
+autocorr <- autocorrelation(c1$b0s, 40)
+a<- ggplot(autocorr, aes(x = lag, y= rho)) + 
+    geom_bar(width = 0.1, stat = "identity", position = "identity", fill = "skyblue") + 
+    geom_point(color = "#FFDB6D", size = 1.3)+
+    theme_classic()
+# b1 
+autocorr <- autocorrelation(c1$b1s, 40)
+b<- ggplot(autocorr, aes(x = lag, y= rho)) + 
+    geom_bar(width = 0.1, stat = "identity", position = "identity", fill = "skyblue") + 
+    geom_point(color = "#FFDB6D", size = 1.3)+
+    theme_classic()
+# b2 
+autocorr <- autocorrelation(c1$b2s, 40)
+c<- ggplot(autocorr, aes(x = lag, y= rho)) + 
+    geom_bar(width = 0.1, stat = "identity", position = "identity", fill = "skyblue") + 
+    geom_point(color = "#FFDB6D", size = 1.3)+
+    theme_classic()
+# b3
+autocorr <- autocorrelation(c1$b3s, 40)
+e<- ggplot(autocorr, aes(x = lag, y= rho)) + 
+    geom_bar(width = 0.1, stat = "identity", position = "identity", fill = "skyblue") + 
+    geom_point(color = "#FFDB6D", size = 1.3)+
+    theme_classic()
+# b4
+autocorr <- autocorrelation(c1$b4s, 40)
+f<- ggplot(autocorr, aes(x = lag, y= rho)) + 
+    geom_bar(width = 0.1, stat = "identity", position = "identity", fill = "skyblue") + 
+    geom_point(color = "#FFDB6D", size = 1.3)+
+    theme_classic()
+# s2 
+autocorr <- autocorrelation(c1$s2s, 40)
+g<- ggplot(autocorr, aes(x = lag, y= rho)) + 
+    geom_bar(width = 0.1, stat = "identity", position = "identity", fill = "skyblue") + 
+    geom_point(color = "#FFDB6D", size = 1.3)+
+    theme_classic()
+
+p<-plot_grid(a,b,c,e,f,g, labels=c("b0", "b1", "b2", "b3","b4s", "s2"), ncol = 3, nrow = 2)
+title <- ggdraw() + draw_label("Figure 2. AutoCorrelation for the Regression Parameters of the Interaction Model", fontface='bold', size =22, hjust=0.9)
+plot_grid(title, p, ncol=1, rel_heights=c(0.1, 1))
+ggsave("autocorrelation.pdf") # save plot for report
+```
+```{r}
+# Gelman Rubin Statistic
+L = nrow(c1)  # number of iterations after discarding burn-in
+J = 2         # number of chains
+
+gr_stat <- function(L, c1, c2){
+  c1<- c1[1:L,]                                           # subset sample based on L 
+  c1_means <- sapply(c1, mean)                            # parameter means 
+  c1_var   <- sapply(c1, var)                             # parameter variances
+  
+  c2 <- c2[1:L,]                
+  c2_means <- sapply(c2,mean)                             # again for chain 2
+  c2_var   <- sapply(c2,var)
+  
+  chain_means <- as.matrix(rbind(c1_means, c2_means))     # save chain means in matrix
+  chain_var   <- as.matrix(rbind(c1_var, c2_var))         # save chain variances in matrix
+  tot<- rbind(c1, c2)                 
+  grand_means<- sapply(tot, mean)                         # grand means 
+  
+  B<- c()
+  W<- c()
+  R<- c()
+  
+  for (i in 1:q){
+    B[i] <- L/ (J-1) * sum((grand_means[i] - chain_means[,i])^2)   # between chain variance
+    W[i] <- 1/J * sum(chain_var[,i])}                              # within chain variance
+  
+  R    <- (L-1)/L + (1/L)*B/W
+  return(R)}
+# GR statistic when L = 10000, the full sample
+gr_stat(L, c1, c2)
+```
+
+```{r, fig.height=2.5, fig.width=11}
+# Gelman Rubin Plot 
+gr_store <- matrix(nrow = 100, ncol = q)                           # storage
+colnames(gr_store)<- c("b0", "b1", "b2", "b3","b4","s2")            
+L<-c(seq(100, 10000, by = 100))                                    # specify steps
+for (i in 1:length(L)){                                            # at each step: 
+  gr_store[i,] <- gr_stat(L[i], c1, c2)                            # calculate the GT stats
+}
+gr_store<- as.data.frame(cbind(gr_store,L))
+gr_store_long<- gather(gr_store, key="measure", value="value", c("b0", "b1", "b2", "b3", "b4", "s2"))
+
+ggplot(gr_store_long) + 
+  geom_line(aes(x = L, y = value, color = measure), size= 0.7) +
+  xlab("Iteration")+ 
+  ylab("Gelman Rubin Statistic")+
+  ggtitle("Figure 3. Gelman Rubin Plot for the Regression Parameters of the Interaction Model")+
+  theme_classic()+
+  theme(plot.title = element_text(face = "bold", size = 22))
+ggsave("gr_stat.pdf")
+```
+
+```{r}
+# MCMC Error 
+mcmc_error <- function(input){
+  mce <- sqrt(var(input)) / sqrt(10000)
+  return(mce)}
+
+mcmce_c1 <- sapply(c1, mcmc_error)                             # mcmc error for each parameter
+mcmce_c2 <- sapply(c2, mcmc_error)                             # same for chain 2
+```
+
+```{r}
+# Check Model Assumption using a PPV
+test <- function(residuals){ # test statistic function -- normality
+  standard_deviation <- sd(residuals)                                 # residual sd
+  mean <- mean(residuals)                                             # residual mean
+  x <- c(mean - standard_deviation, mean + standard_deviation)        # range of one sd from the mean
+  a <- pnorm(1)-pnorm(-1)                                             # proportion of normal obs w/n one
+  ind <- c()                                                          # sd of the mean (~68%)
+  for (i in 1:length(residuals)){
+    ind[i] = ifelse(residuals[i] < x[2] & residuals[i] > x[1], 1, 0)} # count how many residuals in range
+  prop = sum(ind)/length(residuals)                                   # proportion in range
+  value = (a - prop)^2                                                # square distance from 68%
+  return(value)}
+```
+
+```{r}
+# ppv calculation
+sub_c1 <- c1[1:1000,]                      # work with a subset of parameter samples 
+sim_stat <- matrix(nrow = nrow(sub_c1))    # storage
+obs_stat <- matrix(nrow = nrow(sub_c1))                   
+X <- cbind(rep(1,n), x1,x2,x3,x4)          # design matrix
+
+# predicted data sets test statistics
+for (j in 1:nrow(sub_c1)){                 # for each set of sampled parameter values
+    B <- as.numeric(sub_c1[j, 1:5])        # betas 
+    sd<- sqrt(sub_c1[j,6])                 # sd
+    y_hat <- X%*%B                         # fitted
+    y_i   <- y_hat + rnorm(n, 0, sd)       # simulated
+    es    <- y_i - y_hat                   # residual
+    sim_stat[j,1] <- test(es)              # normality test statistic
+}
+# observed test statistic 
+for (j in 1:nrow(sub_c1)){                 # for each set of sampled parameter values
+    B <- as.numeric(sub_c1[j, 1:5])        # betas 
+    sd<- sqrt(sub_c1[j,6])                 # sd
+    y_hat <- X%*%B                         # fitted
+    y_i   <- y                             # observed
+    es    <- y_i - y_hat                   # residual
+    obs_stat[j,1] <- test(es)              # normality test statistic
+}
+ppc<- sum(ifelse(sim_stat > obs_stat,1,0))/n 
+ppc
+```
+
+```{r}
+# Obtain Parameter Estimates, Credible Intervals and Interpretations
+means <- sapply(c1, mean)
+sds   <- sapply(c1, sd)
+two.5 <- sapply(c1, quantile, probs = 0.025)
+med   <- sapply(c1, median)
+ni7.5 <- sapply(c1, quantile, probs = 0.975)
+a<- cbind(means, sds, mcmce_c1, two.5, med, ni7.5)
+
+# Create Data Frame to Store Values 
+rownames(a) <- colnames(c1)
+colnames(a) <- c("Mean", "SD", "Naive SE", "2.5%", "Median", "97.5%")
+sample_info<- as.data.frame(a)
+sample_info
+```
+```{r}
+# DIC 
+dic_calculator <- function(input){
+params <- as.vector(apply(input, 2, mean))                                # retrieve EAPs
+pDIC <- 2*(loglikelihood(params) - mean(apply(input, 1, loglikelihood)))  # pDIC
+DIC <- -2*loglikelihood(params) + 2*pDIC                                  # DIC
+return(DIC)
+}
+loglikelihood <- function(params){ 
+  B    <- params[1:(length(params)-1)]    
+  sd   <- sqrt(params[length(params)])          
+  l_i <- dnorm(y, X%*%B, sd)  
+  ll_i<- log(l_i)
+  ll  <- sum(ll_i)
+  return(ll)
+}
+# DIC interaction model 
+X <- cbind(rep(1,n), x1,x2,x3,x4)     # design matrix with interaction
+samples1 <- samples %>% 
+            select(-ks, -l)
+dic_calculator(samples1)
+
+# DIC no interaction 
+X <- cbind(rep(1,n), x1,x2,x3)        # design matrix no interaction 
+samples2 <- samples2 %>%
+            select(-ks, -l, -b4s)
+dic_calculator(samples2)
+```
+
+```{r}
+# Bayes Factor
+mod <- lm(charges ~ age + bmi + smoker, data=d)
+results_1 <- bain(mod, "age > smoker & age > bmi", standardize = T)
+print(results_1)
+
+mod <- lm(charges ~ age + bmi + smoker + interaction, data=d)
+results_2 <- bain(mod, "interaction > 0", standardize = T)
+print(results_2)
+```
+
+
+```{r}
+# Does my Discrepancy Measure Have Power? 
+set.seed(911)
+x <- matrix(nrow=100, ncol=1000)
+y <- matrix(nrow=100, ncol=1000)
+z <- matrix(nrow=100, ncol=1000)
+  
+for(i in 1:100){
+x[i,] <- rnorm( 1000, 1, 1)      # generates 1000 rows of normal data 
+y[i,] <- rgamma(1000, 1, 0.5)    # generates 1000 rows of gamma data right skew
+z[i,] <- rgamma(1000, 1, 2)      # generates 1000 rows of gamma data extremely right skew
+
+test_x <- apply(x, 1, test)      # apply test statistic to each row
+test_y <- apply(y, 1, test)       
+test_z <- apply(z, 1, test)
+
+means <- c(mean(test_x), mean(test_y), mean(test_z))
+sds   <- c(sqrt(var(test_x)), sqrt(var(test_y)), sqrt(var(test_z)))
+}
+```
+
+```{r, fig.height=3, fig.width =10} 
+# plot the distributions
+forplot <- as.data.frame(cbind(x[1,], y[1,],z[1,]))
+forplot_long<-  gather(forplot, key="measure", value="value", c("V1", "V2", "V3"))
+  
+ggplot(data=forplot_long)+
+  geom_density(aes(x = value, color= measure))+
+  scale_color_discrete(name = "Distribution", labels = c("N(1,1)", "Gamma(1, 0.5)", "Gamma(1,2)"))+
+  theme_classic()
+ggsave("ppcplot.pdf")
+```
+```{r}
+# save this information for the report 
+a <- as.data.frame(cbind(means, sds))
+rownames(a) <- c("Normal (1,1)", "Gamma (1, 0.5)", "Gamma (1, 2)")
+write.csv(a, "ppc_info.csv")
+```
+
+```{r}
+# CHECK RESULTS WITH LM 
+check1<- lm(charges ~ bmi + age + smoker + interaction, data = d)      # interaction estimates match 
+summary(check1)                                                        
+check2<- lm(charges~ bmi + smoker + age, data = d)                     # no interaction estimates match 
+summary(check2)
+```
+
+```{r}
+plot(check1) # residuals NOT normal -- agrees with ppc
+plot(check2) # residuals NOT normal -- agrees with ppc
+```
+
+```{r}
+# GET PRIORS 
+library(devtools)
+library(MEPS)
+library(haven)
+install_github("e-mitchell/meps_r_pkg/MEPS")           # import data from MEPS
+dn2018 = read_MEPS(year = 2018, type="FYC")            # save data 
+
+d <- dn2018%>% 
+     select(TOTTCH18, ADOFTB42, ADBMI42, AGELAST) %>% 
+     filter(ADBMI42 > 0) %>%
+     filter(ADOFTB42> 0) %>% 
+     filter(TOTTCH18> 0) %>%
+     filter(AGELAST>18)%>%
+     mutate(smoker = ifelse(ADOFTB42 >2 , "no", "yes")) %>% 
+     mutate(charges = log(TOTTCH18)) %>%
+     mutate_at(c("charges", "ADOFTB42", "AGELAST"), scale)%>%  
+     select(charges, ADBMI42, smoker, AGELAST)
+
+prior_info <- lm(charges~ ADBMI42 + smoker + AGELAST, data = d)
+summary(prior_info)
+```
+
+
